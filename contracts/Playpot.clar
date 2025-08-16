@@ -17,6 +17,9 @@
 (define-constant ERR_NOT_PARTICIPANT (err u115))
 (define-constant ERR_ROUND_NOT_COMPLETE (err u116))
 (define-constant ERR_INVALID_BRACKET_SIZE (err u117))
+(define-constant ERR_PLAYER_NOT_FOUND (err u118))
+(define-constant ERR_INVALID_RATING_CHANGE (err u119))
+(define-constant ERR_RATING_ALREADY_UPDATED (err u120))
 
 (define-data-var next-tournament-id uint u1)
 
@@ -76,6 +79,30 @@
   { tournament-id: uint, player: principal }
   { round: uint, match-id: uint, position: uint }
 )
+
+(define-map player-ratings
+  principal
+  {
+    current-rating: uint,
+    peak-rating: uint,
+    tournaments-played: uint,
+    tournaments-won: uint,
+    last-updated: uint,
+    provisional: bool
+  }
+)
+
+(define-map tournament-rating-updates
+  { tournament-id: uint, player: principal }
+  { old-rating: uint, new-rating: uint, updated: bool }
+)
+
+(define-map rating-leaderboard
+  uint
+  { player: principal, rating: uint }
+)
+
+(define-data-var leaderboard-size uint u0)
 
 (define-public (create-tournament (name (string-ascii 50)) (entry-fee uint) (max-players uint) (duration-blocks uint))
   (let
@@ -657,3 +684,356 @@
     )
   )
 )
+
+(define-private (calculate-k-factor (rating uint) (provisional bool))
+  (if provisional
+    u50
+    (if (< rating u2000)
+      u40
+      (if (< rating u2400)
+        u20
+        u10
+      )
+    )
+  )
+)
+
+(define-private (calculate-expected-score (rating-a uint) (rating-b uint))
+  (let
+    (
+      (rating-diff (if (> rating-a rating-b) (- rating-a rating-b) (- rating-b rating-a)))
+      (is-a-higher (> rating-a rating-b))
+    )
+    (if (>= rating-diff u400)
+      (if is-a-higher u95 u5)
+      (if (>= rating-diff u300)
+        (if is-a-higher u85 u15)
+        (if (>= rating-diff u200)
+          (if is-a-higher u75 u25)
+          (if (>= rating-diff u100)
+            (if is-a-higher u65 u35)
+            u50
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-private (calculate-new-rating (current-rating uint) (k-factor uint) (actual-score uint) (expected-score uint))
+  (let
+    (
+      (score-diff (if (> actual-score expected-score) 
+                    (- actual-score expected-score) 
+                    (- expected-score actual-score)))
+      (rating-change (/ (* k-factor score-diff) u100))
+      (is-positive (> actual-score expected-score))
+    )
+    (if is-positive
+      (+ current-rating rating-change)
+      (if (> current-rating rating-change)
+        (- current-rating rating-change)
+        u800
+      )
+    )
+  )
+)
+
+(define-public (initialize-player-rating (player principal))
+  (let
+    (
+      (existing-rating (map-get? player-ratings player))
+    )
+    (asserts! (is-none existing-rating) ERR_ALREADY_REGISTERED)
+    
+    (map-set player-ratings player
+      {
+        current-rating: u1200,
+        peak-rating: u1200,
+        tournaments-played: u0,
+        tournaments-won: u0,
+        last-updated: stacks-block-height,
+        provisional: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-rating-after-match (tournament-id uint) (winner principal) (loser principal))
+  (let
+    (
+      (tournament (unwrap! (map-get? tournaments tournament-id) ERR_TOURNAMENT_NOT_FOUND))
+      (winner-rating-data (unwrap! (map-get? player-ratings winner) ERR_PLAYER_NOT_FOUND))
+      (loser-rating-data (unwrap! (map-get? player-ratings loser) ERR_PLAYER_NOT_FOUND))
+      (winner-rating (get current-rating winner-rating-data))
+      (loser-rating (get current-rating loser-rating-data))
+      (winner-provisional (get provisional winner-rating-data))
+      (loser-provisional (get provisional loser-rating-data))
+      (winner-k (calculate-k-factor winner-rating winner-provisional))
+      (loser-k (calculate-k-factor loser-rating loser-provisional))
+      (winner-expected (calculate-expected-score winner-rating loser-rating))
+      (loser-expected (calculate-expected-score loser-rating winner-rating))
+      (winner-new-rating (calculate-new-rating winner-rating winner-k u100 winner-expected))
+      (loser-new-rating (calculate-new-rating loser-rating loser-k u0 loser-expected))
+      (winner-update-exists (map-get? tournament-rating-updates { tournament-id: tournament-id, player: winner }))
+      (loser-update-exists (map-get? tournament-rating-updates { tournament-id: tournament-id, player: loser }))
+    )
+    (asserts! (is-eq tx-sender (get creator tournament)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none winner-update-exists) ERR_RATING_ALREADY_UPDATED)
+    (asserts! (is-none loser-update-exists) ERR_RATING_ALREADY_UPDATED)
+    
+    (map-set tournament-rating-updates { tournament-id: tournament-id, player: winner }
+      { old-rating: winner-rating, new-rating: winner-new-rating, updated: true }
+    )
+    (map-set tournament-rating-updates { tournament-id: tournament-id, player: loser }
+      { old-rating: loser-rating, new-rating: loser-new-rating, updated: true }
+    )
+    
+    (map-set player-ratings winner
+      (merge winner-rating-data {
+        current-rating: winner-new-rating,
+        peak-rating: (if (> winner-new-rating (get peak-rating winner-rating-data)) 
+                       winner-new-rating 
+                       (get peak-rating winner-rating-data)),
+        last-updated: stacks-block-height,
+        provisional: (if (>= (get tournaments-played winner-rating-data) u5) false true)
+      })
+    )
+    
+    (map-set player-ratings loser
+      (merge loser-rating-data {
+        current-rating: loser-new-rating,
+        peak-rating: (if (> loser-new-rating (get peak-rating loser-rating-data)) 
+                       loser-new-rating 
+                       (get peak-rating loser-rating-data)),
+        last-updated: stacks-block-height,
+        provisional: (if (>= (get tournaments-played loser-rating-data) u5) false true)
+      })
+    )
+    
+    (let
+      (
+        (winner-board-result (update-leaderboard winner winner-new-rating))
+        (loser-board-result (update-leaderboard loser loser-new-rating))
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (update-tournament-participation (tournament-id uint) (player principal) (won bool))
+  (let
+    (
+      (tournament (unwrap! (map-get? tournaments tournament-id) ERR_TOURNAMENT_NOT_FOUND))
+      (rating-data (unwrap! (map-get? player-ratings player) ERR_PLAYER_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator tournament)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status tournament) "completed") ERR_TOURNAMENT_NOT_ENDED)
+    
+    (map-set player-ratings player
+      (merge rating-data {
+        tournaments-played: (+ (get tournaments-played rating-data) u1),
+        tournaments-won: (if won 
+                          (+ (get tournaments-won rating-data) u1) 
+                          (get tournaments-won rating-data))
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-leaderboard (player principal) (new-rating uint))
+  (let
+    (
+      (current-size (var-get leaderboard-size))
+    )
+    (if (< current-size u10)
+      (begin
+        (map-set rating-leaderboard current-size { player: player, rating: new-rating })
+        (var-set leaderboard-size (+ current-size u1))
+        (sort-leaderboard)
+      )
+      (insert-or-update-leaderboard player new-rating)
+    )
+  )
+)
+
+(define-private (insert-or-update-leaderboard (player principal) (rating uint))
+  (let
+    (
+      (lowest-entry (unwrap! (map-get? rating-leaderboard u9) ERR_PLAYER_NOT_FOUND))
+      (lowest-rating (get rating lowest-entry))
+    )
+    (if (> rating lowest-rating)
+      (begin
+        (map-set rating-leaderboard u9 { player: player, rating: rating })
+        (sort-leaderboard)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-private (sort-leaderboard)
+  (let
+    (
+      (size (var-get leaderboard-size))
+    )
+    (if (> size u1)
+      (begin
+        (try! (bubble-sort-step u0))
+        (and (or (<= size u2) (get-sorted-result (bubble-sort-step u1)))
+             (or (<= size u3) (get-sorted-result (bubble-sort-step u2)))
+             (or (<= size u4) (get-sorted-result (bubble-sort-step u3)))
+             (or (<= size u5) (get-sorted-result (bubble-sort-step u4)))
+             (or (<= size u6) (get-sorted-result (bubble-sort-step u5)))
+             (or (<= size u7) (get-sorted-result (bubble-sort-step u6)))
+             (or (<= size u8) (get-sorted-result (bubble-sort-step u7)))
+             (or (<= size u9) (get-sorted-result (bubble-sort-step u8))))
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-private (get-sorted-result (result (response bool uint)))
+  (is-ok result)
+)
+
+(define-private (bubble-sort-step (index uint))
+  (let
+    (
+      (current-entry (unwrap! (map-get? rating-leaderboard index) ERR_PLAYER_NOT_FOUND))
+      (next-entry (unwrap! (map-get? rating-leaderboard (+ index u1)) ERR_PLAYER_NOT_FOUND))
+      (current-rating (get rating current-entry))
+      (next-rating (get rating next-entry))
+    )
+    (if (< current-rating next-rating)
+      (begin
+        (map-set rating-leaderboard index next-entry)
+        (map-set rating-leaderboard (+ index u1) current-entry)
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-public (get-skill-matchmaking-group (player principal))
+  (let
+    (
+      (rating-data (map-get? player-ratings player))
+    )
+    (match rating-data
+      data
+      (let
+        (
+          (rating (get current-rating data))
+        )
+        (if (< rating u1000)
+          (ok "bronze")
+          (if (< rating u1400)
+            (ok "silver")
+            (if (< rating u1800)
+              (ok "gold")
+              (if (< rating u2200)
+                (ok "platinum")
+                (ok "diamond")
+              )
+            )
+          )
+        )
+      )
+      ERR_PLAYER_NOT_FOUND
+    )
+  )
+)
+
+(define-public (find-balanced-match (player1 principal) (player2 principal))
+  (let
+    (
+      (rating1-data (unwrap! (map-get? player-ratings player1) ERR_PLAYER_NOT_FOUND))
+      (rating2-data (unwrap! (map-get? player-ratings player2) ERR_PLAYER_NOT_FOUND))
+      (rating1 (get current-rating rating1-data))
+      (rating2 (get current-rating rating2-data))
+      (rating-diff (if (> rating1 rating2) (- rating1 rating2) (- rating2 rating1)))
+    )
+    (if (<= rating-diff u200)
+      (ok "excellent-match")
+      (if (<= rating-diff u400)
+        (ok "good-match")
+        (if (<= rating-diff u600)
+          (ok "fair-match")
+          (ok "poor-match")
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-player-rating (player principal))
+  (map-get? player-ratings player)
+)
+
+(define-read-only (get-tournament-rating-update (tournament-id uint) (player principal))
+  (map-get? tournament-rating-updates { tournament-id: tournament-id, player: player })
+)
+
+(define-read-only (get-leaderboard-entry (position uint))
+  (map-get? rating-leaderboard position)
+)
+
+(define-read-only (get-leaderboard-size)
+  (var-get leaderboard-size)
+)
+
+(define-read-only (get-player-rank (player principal))
+  (let
+    (
+      (size (var-get leaderboard-size))
+    )
+    (search-leaderboard-for-player player size)
+  )
+)
+
+(define-private (search-leaderboard-for-player (target-player principal) (max-size uint))
+  (let
+    (
+      (pos0 (map-get? rating-leaderboard u0))
+      (pos1 (map-get? rating-leaderboard u1))
+      (pos2 (map-get? rating-leaderboard u2))
+      (pos3 (map-get? rating-leaderboard u3))
+      (pos4 (map-get? rating-leaderboard u4))
+      (pos5 (map-get? rating-leaderboard u5))
+      (pos6 (map-get? rating-leaderboard u6))
+      (pos7 (map-get? rating-leaderboard u7))
+      (pos8 (map-get? rating-leaderboard u8))
+      (pos9 (map-get? rating-leaderboard u9))
+    )
+    (if (and (is-some pos0) (is-eq (get player (unwrap-panic pos0)) target-player)) (some u1)
+      (if (and (is-some pos1) (is-eq (get player (unwrap-panic pos1)) target-player)) (some u2)
+        (if (and (is-some pos2) (is-eq (get player (unwrap-panic pos2)) target-player)) (some u3)
+          (if (and (is-some pos3) (is-eq (get player (unwrap-panic pos3)) target-player)) (some u4)
+            (if (and (is-some pos4) (is-eq (get player (unwrap-panic pos4)) target-player)) (some u5)
+              (if (and (is-some pos5) (is-eq (get player (unwrap-panic pos5)) target-player)) (some u6)
+                (if (and (is-some pos6) (is-eq (get player (unwrap-panic pos6)) target-player)) (some u7)
+                  (if (and (is-some pos7) (is-eq (get player (unwrap-panic pos7)) target-player)) (some u8)
+                    (if (and (is-some pos8) (is-eq (get player (unwrap-panic pos8)) target-player)) (some u9)
+                      (if (and (is-some pos9) (is-eq (get player (unwrap-panic pos9)) target-player)) (some u10)
+                        none
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+
