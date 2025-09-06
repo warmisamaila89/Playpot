@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Playpot.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.tournament-sponsors]
+path = 'contracts/tournament-sponsors.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
